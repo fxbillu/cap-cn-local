@@ -1,0 +1,21 @@
+{
+	"$schema": "https://schema.tauri.app/config/2",
+	"productName": "Cap 中文版",
+	"mainBinaryName": "Cap-CN",
+	"identifier": "local.cap.desktop.zhcn",
+	"plugins": {
+		"updater": {
+			"active": false,
+			"endpoints": [],
+			"pubkey": ""
+		}
+	},
+	"bundle": {
+		"createUpdaterArtifacts": false,
+		"windows": {
+			"wix": {
+				"upgradeCode": "d3418905-8b91-4f0b-b686-a08221b59256"
+			}
+		}
+	}
+}

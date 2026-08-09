@@ -1,0 +1,660 @@
+// @ts-check
+
+import { exec as execCb, execFile as execFileCb } from "node:child_process";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
+import { env } from "node:process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const exec = promisify(execCb);
+const execFile = promisify(execFileCb);
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const __root = path.resolve(path.join(__dirname, ".."));
+const targetDir = path.join(__root, "target");
+
+const arch =
+	process.env.RUST_TARGET_TRIPLE?.split("-")[0] ??
+	(process.arch === "arm64" ? "aarch64" : "x86_64");
+
+const FFMPEG_CARGO_ENV = `[env]
+FFMPEG_DIR = { relative = true, force = true, value = "target/native-deps" }
+`;
+
+function cargoConfigPath(value) {
+	return value.replaceAll("\\", "/");
+}
+
+async function main() {
+	await fs.mkdir(targetDir, { recursive: true });
+
+	let cargoConfigContents = "";
+	let cargoBuildContents = "";
+	const sccachePath = await findExecutable("sccache");
+	const useSccache = env.CAP_USE_SCCACHE === "1";
+
+	if (sccachePath && useSccache && (await canUseSccache(sccachePath))) {
+		cargoBuildContents += `\n[build]\nrustc-wrapper = "${sccachePath.replaceAll("\\", "/")}"\n`;
+		console.log(`Using sccache at ${sccachePath}`);
+	} else if (!sccachePath)
+		console.log("sccache not found, using rustc directly");
+	else if (!useSccache)
+		console.log(
+			`sccache found at ${sccachePath}, using rustc directly. Set CAP_USE_SCCACHE=1 to enable it.`,
+		);
+
+	if (process.platform === "darwin") {
+		cargoConfigContents += FFMPEG_CARGO_ENV;
+
+		const NATIVE_DEPS_VERSION = "v0.25";
+		const NATIVE_DEPS_URL = `https://github.com/spacedriveapp/native-deps/releases/download/${NATIVE_DEPS_VERSION}`;
+
+		const NATIVE_DEPS_ASSETS = {
+			x86_64: "native-deps-x86_64-darwin-apple.tar.xz",
+			aarch64: "native-deps-aarch64-darwin-apple.tar.xz",
+		};
+
+		const nativeDepsTar = NATIVE_DEPS_ASSETS[arch];
+		const nativeDepsTarPath = path.join(
+			targetDir,
+			`${NATIVE_DEPS_VERSION}-${nativeDepsTar}`,
+		);
+		let downloadedNativeDeps = false;
+
+		if (!(await fileExists(nativeDepsTarPath))) {
+			console.log(`Downloading ${nativeDepsTar}`);
+			const nativeDepsBytes = await fetch(`${NATIVE_DEPS_URL}/${nativeDepsTar}`)
+				.then((r) => r.blob())
+				.then((b) => b.arrayBuffer());
+			await fs.writeFile(nativeDepsTarPath, Buffer.from(nativeDepsBytes));
+			console.log("Downloaded native deps");
+			downloadedNativeDeps = true;
+		} else console.log(`Using cached ${nativeDepsTar}`);
+
+		const nativeDepsFolder = `native-deps`;
+		const nativeDepsDir = path.join(targetDir, nativeDepsFolder);
+		const frameworkDir = path.join(nativeDepsDir, "Spacedrive.framework");
+		if (downloadedNativeDeps || !(await fileExists(nativeDepsDir))) {
+			await fs.mkdir(nativeDepsDir, { recursive: true });
+			await execFile("tar", ["xf", nativeDepsTarPath, "-C", nativeDepsDir]);
+			console.log(`Extracted ${nativeDepsFolder}`);
+		} else console.log(`Using cached ${nativeDepsFolder}`);
+
+		const frameworkTargetDir = path.join(
+			targetDir,
+			"Frameworks",
+			"Spacedrive.framework",
+		);
+		const debugDir = path.join(targetDir, "debug");
+		const nativeLibDir = path.join(nativeDepsDir, "lib");
+		const needsFrameworkSync =
+			downloadedNativeDeps ||
+			!(await fileExists(frameworkTargetDir)) ||
+			(await missingFiles(debugDir, await fs.readdir(nativeLibDir)).then(
+				(files) => files.length > 0,
+			));
+
+		if (needsFrameworkSync) {
+			await trimMacOSFramework(frameworkDir);
+			console.log("Trimmed .framework");
+
+			console.log("Signing .framework libraries");
+			await signMacOSFrameworkLibs(frameworkDir);
+			console.log("Signed .framework libraries");
+
+			await fs.rm(frameworkTargetDir, { recursive: true }).catch(() => {});
+			await fs.cp(
+				frameworkDir,
+				path.join(targetDir, "Frameworks", "Spacedrive.framework"),
+				{ recursive: true },
+			);
+
+			await fs.mkdir(debugDir, { recursive: true });
+			const nativeLibs = await fs.readdir(nativeLibDir);
+			for (const name of nativeLibs) {
+				await fs.copyFile(
+					path.join(nativeLibDir, name),
+					path.join(debugDir, name),
+				);
+			}
+			console.log("Copied ffmpeg dylibs to target/debug");
+		} else console.log("Using cached macOS native deps setup");
+
+		const onnxRuntimePath = await setupMacOSOnnxRuntime();
+		cargoConfigContents += `ORT_DYLIB_PATH = { relative = true, force = true, value = "${path.relative(
+			__root,
+			onnxRuntimePath,
+		)}" }\n`;
+	} else if (process.platform === "win32") {
+		cargoConfigContents += FFMPEG_CARGO_ENV;
+
+		await ensureMsvcVersion();
+
+		const FFMPEG_VERSION = "7.1";
+		const FFMPEG_ZIP_NAME = `ffmpeg-${FFMPEG_VERSION}-full_build-shared`;
+		const FFMPEG_ZIP_URL = `https://github.com/GyanD/codexffmpeg/releases/download/${FFMPEG_VERSION}/${FFMPEG_ZIP_NAME}.zip`;
+
+		await fs.mkdir(targetDir, { recursive: true });
+
+		let downloadedFfmpeg = false;
+		const ffmpegZip = `ffmpeg-${FFMPEG_VERSION}.zip`;
+		const ffmpegZipPath = path.join(targetDir, ffmpegZip);
+		if (!(await fileExists(ffmpegZipPath))) {
+			const ffmpegZipBytes = await fetch(FFMPEG_ZIP_URL)
+				.then((r) => r.blob())
+				.then((b) => b.arrayBuffer());
+			await fs.writeFile(ffmpegZipPath, Buffer.from(ffmpegZipBytes));
+			console.log(`Downloaded ${ffmpegZip}`);
+			downloadedFfmpeg = true;
+		} else console.log(`Using cached ${ffmpegZip}`);
+
+		const ffmpegDir = path.join(targetDir, "ffmpeg");
+		if (!(await fileExists(ffmpegDir)) || downloadedFfmpeg) {
+			await exec(
+				`Expand-Archive -Path "${ffmpegZipPath}" -DestinationPath "${targetDir}" -Force`,
+				{ shell: "powershell.exe" },
+			);
+			await fs.rm(ffmpegDir, { recursive: true, force: true }).catch(() => {});
+			await fs.rename(path.join(targetDir, FFMPEG_ZIP_NAME), ffmpegDir);
+			console.log("Extracted ffmpeg");
+		} else console.log("Using cached ffmpeg");
+
+		for (const profile of ["debug", "release"]) {
+			await fs.mkdir(path.join(targetDir, profile), { recursive: true });
+			for (const name of await fs.readdir(path.join(ffmpegDir, "bin"))) {
+				await fs.copyFile(
+					path.join(ffmpegDir, "bin", name),
+					path.join(targetDir, profile, name),
+				);
+			}
+		}
+		console.log("Copied ffmpeg DLLs to target/debug and target/release");
+
+		if (!(await fileExists(path.join(targetDir, "native-deps"))))
+			await fs.mkdir(path.join(targetDir, "native-deps"), { recursive: true });
+
+		await fs.cp(
+			path.join(ffmpegDir, "lib"),
+			path.join(targetDir, "native-deps", "lib"),
+			{
+				recursive: true,
+				force: true,
+			},
+		);
+		await fs.cp(
+			path.join(ffmpegDir, "include"),
+			path.join(targetDir, "native-deps", "include"),
+			{
+				recursive: true,
+				force: true,
+			},
+		);
+		console.log("Copied ffmpeg/lib and ffmpeg/include to target/native-deps");
+
+		const onnxRuntimePath = await setupWindowsOnnxRuntime();
+		cargoConfigContents += `ORT_DYLIB_PATH = { relative = true, force = true, value = "${cargoConfigPath(
+			path.relative(__root, onnxRuntimePath),
+		)}" }\n`;
+
+		const { stdout: vcInstallDir } = await exec(
+			// biome-ignore lint/suspicious/noTemplateCurlyInString: PowerShell syntax, not JS template literal
+			'$(& "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe" -latest -property installationPath)',
+			{ shell: "powershell.exe" },
+		);
+
+		const libclangPath = path.join(
+			vcInstallDir.trim(),
+			"VC/Tools/LLVM/x64/bin/libclang.dll",
+		);
+
+		cargoConfigContents += `LIBCLANG_PATH = "${libclangPath.replaceAll(
+			"\\",
+			"/",
+		)}"\n`;
+	} else if (process.platform === "linux") {
+		const triple = process.env.RUST_TARGET_TRIPLE;
+		if (triple) {
+			cargoConfigContents += FFMPEG_CARGO_ENV;
+
+			const NATIVE_DEPS_VERSION = "v0.26";
+			const NATIVE_DEPS_URL = `https://github.com/spacedriveapp/native-deps/releases/download/${NATIVE_DEPS_VERSION}`;
+			const NATIVE_DEPS_ASSETS = {
+				x86_64: "native-deps-x86_64-linux-gnu.tar.xz",
+				aarch64: "native-deps-aarch64-linux-gnu.tar.xz",
+			};
+
+			const nativeDepsTar = NATIVE_DEPS_ASSETS[arch];
+			if (!nativeDepsTar)
+				throw new Error(`Unsupported Linux arch for native deps: ${arch}`);
+
+			const nativeDepsTarPath = path.join(
+				targetDir,
+				`${NATIVE_DEPS_VERSION}-${nativeDepsTar}`,
+			);
+			let downloadedNativeDeps = false;
+			if (!(await fileExists(nativeDepsTarPath))) {
+				console.log(`Downloading ${nativeDepsTar}`);
+				const bytes = await fetch(`${NATIVE_DEPS_URL}/${nativeDepsTar}`)
+					.then((r) => r.blob())
+					.then((b) => b.arrayBuffer());
+				await fs.writeFile(nativeDepsTarPath, Buffer.from(bytes));
+				console.log("Downloaded native deps");
+				downloadedNativeDeps = true;
+			} else console.log(`Using cached ${nativeDepsTar}`);
+
+			const nativeDepsDir = path.join(targetDir, "native-deps");
+			const nativeLibDir = path.join(nativeDepsDir, "lib");
+			if (downloadedNativeDeps || !(await fileExists(nativeLibDir))) {
+				await fs
+					.rm(nativeDepsDir, { recursive: true, force: true })
+					.catch(() => {});
+				await fs.mkdir(nativeDepsDir, { recursive: true });
+				await execFile("tar", ["xf", nativeDepsTarPath, "-C", nativeDepsDir]);
+				console.log("Extracted native-deps");
+			} else console.log("Using cached native-deps");
+
+			const debLibDir = path.join(nativeDepsDir, "cap-deb-libs");
+			await fs.rm(debLibDir, { recursive: true, force: true }).catch(() => {});
+			await fs.mkdir(debLibDir, { recursive: true });
+
+			const profileDirs = [];
+			for (const profile of ["debug", "release"]) {
+				profileDirs.push(path.join(targetDir, profile));
+				profileDirs.push(path.join(targetDir, triple, profile));
+			}
+			for (const dir of profileDirs) await fs.mkdir(dir, { recursive: true });
+
+			const sonameLibs = (await fs.readdir(nativeLibDir)).filter((name) =>
+				/\.so\.\d+$/.test(name),
+			);
+			for (const name of sonameLibs) {
+				const realPath = await fs.realpath(path.join(nativeLibDir, name));
+				await fs.copyFile(realPath, path.join(debLibDir, name));
+				for (const dir of profileDirs)
+					await fs.copyFile(realPath, path.join(dir, name));
+			}
+			console.log(
+				`Staged ${sonameLibs.length} FFmpeg shared libraries for Linux bundling`,
+			);
+			await writeLinuxTauriConfig(sonameLibs);
+
+			cargoConfigContents += `\n[target.${triple}]\nrustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN", "-C", "link-arg=-Wl,-rpath,$ORIGIN/../lib/cap"]\n`;
+		}
+	}
+
+	await fs.mkdir(path.join(__root, ".cargo"), { recursive: true });
+	await writeFileIfChanged(
+		path.join(__root, ".cargo/config.toml"),
+		cargoConfigContents + cargoBuildContents,
+	);
+}
+
+main();
+
+async function trimMacOSFramework(frameworkDir) {
+	const headersDir = path.join(frameworkDir, "Headers");
+	const librariesDir = path.join(frameworkDir, "Libraries");
+
+	const libraries = await fs.readdir(librariesDir);
+
+	const unnecessaryLibraries = libraries.filter(
+		(v) =>
+			!(
+				v.startsWith("libav") ||
+				v.startsWith("libsw") ||
+				v.startsWith("libpostproc")
+			),
+	);
+
+	for (const lib of unnecessaryLibraries) {
+		await fs.rm(path.join(librariesDir, lib), { recursive: true });
+	}
+
+	const headers = await fs.readdir(headersDir);
+
+	const unnecessaryHeaders = headers.filter(
+		(v) =>
+			!(
+				v.startsWith("libav") ||
+				v.startsWith("libsw") ||
+				v.startsWith("libpostproc")
+			),
+	);
+
+	for (const header of unnecessaryHeaders) {
+		await fs.rm(path.join(headersDir, header), { recursive: true });
+	}
+
+	const modelsPath = path.join(frameworkDir, "Resources", "Models");
+	if (await fileExists(modelsPath))
+		await fs.rm(modelsPath, {
+			recursive: true,
+		});
+}
+
+async function signMacOSFrameworkLibs(frameworkDir) {
+	const signId = env.APPLE_SIGNING_IDENTITY || "-";
+	const keychain = env.APPLE_KEYCHAIN ? `--keychain ${env.APPLE_KEYCHAIN}` : "";
+	const timestamp = signId === "-" ? "" : "--timestamp";
+
+	// Sign dylibs (Required for them to work on macOS 13+)
+	await fs
+		.readdir(path.join(frameworkDir, "Libraries"), {
+			recursive: true,
+			withFileTypes: true,
+		})
+		.then((files) =>
+			Promise.all(
+				files
+					.filter((entry) => entry.isFile() && entry.name.endsWith(".dylib"))
+					.map((entry) =>
+						exec(
+							`codesign ${keychain} ${timestamp} -s "${signId}" -f "${path.join(
+								entry.parentPath,
+								entry.name,
+							)}"`,
+						),
+					),
+			),
+		);
+}
+
+async function setupMacOSOnnxRuntime() {
+	const asset =
+		arch === "aarch64"
+			? {
+					version: "1.24.2",
+					name: "onnxruntime-osx-arm64-1.24.2.tgz",
+				}
+			: {
+					version: "1.23.2",
+					name: "onnxruntime-osx-x86_64-1.23.2.tgz",
+				};
+	const url = `https://github.com/microsoft/onnxruntime/releases/download/v${asset.version}/${asset.name}`;
+	const archivePath = path.join(targetDir, asset.name);
+	const extractDir = path.join(targetDir, asset.name.replace(/\.tgz$/, ""));
+	const outputDir = path.join(targetDir, "native-deps", "onnxruntime", "lib");
+	const outputPath = path.join(outputDir, "libonnxruntime.dylib");
+	const markerPath = path.join(outputDir, "asset.txt");
+	const marker = await fs
+		.readFile(markerPath, "utf-8")
+		.then((value) => value.trim())
+		.catch(() => null);
+
+	if (!(await fileExists(archivePath))) {
+		console.log(`Downloading ${asset.name}`);
+		const bytes = await fetch(url)
+			.then((r) => r.blob())
+			.then((b) => b.arrayBuffer());
+		await fs.writeFile(archivePath, Buffer.from(bytes));
+		console.log(`Downloaded ${asset.name}`);
+	} else console.log(`Using cached ${asset.name}`);
+
+	if (!(await fileExists(outputPath)) || marker !== asset.name) {
+		await fs.rm(extractDir, { recursive: true, force: true }).catch(() => {});
+		await execFile("tar", ["xf", archivePath, "-C", targetDir]);
+		await fs.mkdir(outputDir, { recursive: true });
+		await fs.copyFile(
+			path.join(extractDir, "lib", "libonnxruntime.dylib"),
+			outputPath,
+		);
+		await signMacOSDylib(outputPath);
+		await fs.writeFile(markerPath, asset.name);
+		console.log("Prepared ONNX Runtime dylib");
+	} else {
+		console.log("Using cached ONNX Runtime dylib");
+		if (env.APPLE_SIGNING_IDENTITY) await signMacOSDylib(outputPath);
+	}
+
+	return outputPath;
+}
+
+async function setupWindowsOnnxRuntime() {
+	const assets = {
+		x86_64: {
+			version: "1.24.2",
+			name: "onnxruntime-win-x64-1.24.2.zip",
+		},
+		aarch64: {
+			version: "1.24.2",
+			name: "onnxruntime-win-arm64-1.24.2.zip",
+		},
+	};
+	const asset = assets[arch];
+	if (!asset)
+		throw new Error(`Unsupported Windows arch for ONNX Runtime: ${arch}`);
+
+	const url = `https://github.com/microsoft/onnxruntime/releases/download/v${asset.version}/${asset.name}`;
+	const archivePath = path.join(targetDir, asset.name);
+	const extractDir = path.join(targetDir, asset.name.replace(/\.zip$/, ""));
+	const outputDir = path.join(targetDir, "native-deps", "onnxruntime", "lib");
+	const outputPath = path.join(outputDir, "onnxruntime.dll");
+	const markerPath = path.join(outputDir, "asset.txt");
+	const marker = await fs
+		.readFile(markerPath, "utf-8")
+		.then((value) => value.trim())
+		.catch(() => null);
+
+	if (!(await fileExists(archivePath))) {
+		console.log(`Downloading ${asset.name}`);
+		const bytes = await fetch(url)
+			.then((r) => r.blob())
+			.then((b) => b.arrayBuffer());
+		await fs.writeFile(archivePath, Buffer.from(bytes));
+		console.log(`Downloaded ${asset.name}`);
+	} else console.log(`Using cached ${asset.name}`);
+
+	if (!(await fileExists(outputPath)) || marker !== asset.name) {
+		await fs.rm(extractDir, { recursive: true, force: true }).catch(() => {});
+		await exec(
+			`Expand-Archive -Path "${archivePath}" -DestinationPath "${targetDir}" -Force`,
+			{ shell: "powershell.exe" },
+		);
+		await fs.rm(outputDir, { recursive: true, force: true }).catch(() => {});
+		await fs.mkdir(outputDir, { recursive: true });
+		const libDir = path.join(extractDir, "lib");
+		const dllNames = (await fs.readdir(libDir)).filter((name) =>
+			name.toLowerCase().endsWith(".dll"),
+		);
+		if (!dllNames.includes("onnxruntime.dll"))
+			throw new Error(`ONNX Runtime archive is missing onnxruntime.dll`);
+
+		for (const name of dllNames) {
+			await fs.copyFile(path.join(libDir, name), path.join(outputDir, name));
+		}
+		await fs.writeFile(markerPath, asset.name);
+		console.log("Prepared ONNX Runtime DLLs");
+	} else console.log("Using cached ONNX Runtime DLLs");
+
+	const dllNames = (await fs.readdir(outputDir)).filter((name) =>
+		name.toLowerCase().endsWith(".dll"),
+	);
+	for (const profile of ["debug", "release"]) {
+		const profileDir = path.join(targetDir, profile);
+		await fs.mkdir(profileDir, { recursive: true });
+		for (const name of dllNames) {
+			await fs.copyFile(
+				path.join(outputDir, name),
+				path.join(profileDir, name),
+			);
+		}
+	}
+	console.log("Copied ONNX Runtime DLLs to target/debug and target/release");
+
+	return outputPath;
+}
+
+async function writeFileIfChanged(filePath, contents) {
+	const currentContents = await fs
+		.readFile(filePath, "utf-8")
+		.catch(() => undefined);
+
+	if (currentContents !== contents) await fs.writeFile(filePath, contents);
+}
+
+async function signMacOSDylib(filePath) {
+	const signId = env.APPLE_SIGNING_IDENTITY || "-";
+	const keychain = env.APPLE_KEYCHAIN ? `--keychain ${env.APPLE_KEYCHAIN}` : "";
+	const timestamp = signId === "-" ? "" : "--timestamp";
+
+	await exec(
+		`codesign ${keychain} ${timestamp} -s "${signId}" -f "${filePath}"`,
+	);
+}
+
+async function fileExists(path) {
+	return await fs
+		.access(path)
+		.then(() => true)
+		.catch(() => false);
+}
+
+async function writeLinuxTauriConfig(sonameLibs) {
+	const configPath = path.join(
+		__root,
+		"apps",
+		"desktop",
+		"src-tauri",
+		"tauri.linux.conf.json",
+	);
+	const files = {};
+
+	for (const name of sonameLibs.toSorted()) {
+		files[`/usr/lib/cap/${name}`] =
+			`../../../target/native-deps/cap-deb-libs/${name}`;
+	}
+
+	await writeFileIfChanged(
+		configPath,
+		`${JSON.stringify({ bundle: { linux: { deb: { files } } } }, null, "\t")}\n`,
+	);
+	console.log(
+		`Generated Linux Tauri deb config with ${sonameLibs.length} shared libraries`,
+	);
+}
+
+async function missingFiles(dir, names) {
+	if (!(await fileExists(dir))) return names;
+
+	const present = new Set(await fs.readdir(dir));
+	return names.filter((name) => !present.has(name));
+}
+
+const MIN_MSVC_VERSION = [17, 12];
+
+async function ensureMsvcVersion() {
+	const programFilesX86 =
+		process.env["ProgramFiles(x86)"] || "C:\\Program Files (x86)";
+	const vswherePath = path.join(
+		programFilesX86,
+		"Microsoft Visual Studio",
+		"Installer",
+		"vswhere.exe",
+	);
+
+	if (!(await fileExists(vswherePath))) {
+		throw new Error(
+			`Visual Studio Installer not found at ${vswherePath}. ` +
+				`Install "Visual Studio 2022 Build Tools" ${MIN_MSVC_VERSION[0]}.${MIN_MSVC_VERSION[1]} ` +
+				`or newer with the "MSVC v143 - VS 2022 C++ x64/x86 build tools" component, ` +
+				`then re-run pnpm dev.`,
+		);
+	}
+
+	const { stdout } = await execFile(vswherePath, [
+		"-latest",
+		"-products",
+		"*",
+		"-requires",
+		"Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+		"-property",
+		"installationVersion",
+	]);
+
+	const raw = stdout.trim();
+	if (!raw) {
+		throw new Error(
+			`No Visual Studio 2022 installation with MSVC v143 was found. ` +
+				`Install "Visual Studio 2022 Build Tools" ${MIN_MSVC_VERSION[0]}.${MIN_MSVC_VERSION[1]} ` +
+				`or newer with the "MSVC v143 - VS 2022 C++ x64/x86 build tools" component, ` +
+				`then re-run pnpm dev.`,
+		);
+	}
+
+	const parts = raw.split(".").map((n) => Number.parseInt(n, 10) || 0);
+	const [major, minor] = parts;
+	const isAtLeast =
+		major > MIN_MSVC_VERSION[0] ||
+		(major === MIN_MSVC_VERSION[0] && minor >= MIN_MSVC_VERSION[1]);
+
+	if (!isAtLeast) {
+		throw new Error(
+			`Visual Studio 2022 Build Tools ${major}.${minor} is too old (full: ${raw}).\n` +
+				`Cap requires ${MIN_MSVC_VERSION[0]}.${MIN_MSVC_VERSION[1]} or newer because the prebuilt ONNX Runtime ` +
+				`shipped by the 'ort' crate references vectorized-algorithm symbols ` +
+				`(e.g. __std_find_last_of_trivial_pos_*, __std_remove_8) that only exist in vcruntime140_1.lib from MSVC 14.42+.\n` +
+				`\nUpdate via the Visual Studio Installer, or from an elevated PowerShell:\n` +
+				`  winget upgrade --id Microsoft.VisualStudio.2022.BuildTools\n` +
+				`After updating, run: cargo clean -p cap-desktop && pnpm dev:windows\n`,
+		);
+	}
+
+	console.log(`MSVC toolchain ${major}.${minor} OK (full: ${raw})`);
+}
+
+async function findExecutable(name) {
+	const command = process.platform === "win32" ? "where.exe" : "which";
+
+	return await execFile(command, [name])
+		.then(({ stdout }) => stdout.trim().split(/\r?\n/).find(Boolean) ?? null)
+		.catch(() => null);
+}
+
+async function canUseSccache(sccachePath) {
+	const rustcPath = env.RUSTC || (await findExecutable("rustc")) || "rustc";
+	const probeDir = await fs.mkdtemp(path.join(targetDir, "sccache-probe-"));
+	const probePath = path.join(probeDir, "lib.rs");
+
+	try {
+		await fs.writeFile(probePath, "fn main() {}\n");
+		await execFile(sccachePath, [
+			rustcPath,
+			probePath,
+			"--crate-name",
+			"___",
+			"--print=file-names",
+			"--crate-type",
+			"bin",
+			"--crate-type",
+			"rlib",
+			"--crate-type",
+			"dylib",
+			"--crate-type",
+			"cdylib",
+			"--crate-type",
+			"staticlib",
+			"--print=sysroot",
+			"--print=split-debuginfo",
+			"--print=crate-name",
+			"--print=cfg",
+			"-Wwarnings",
+		]);
+		return true;
+	} catch (error) {
+		const stderr = typeof error.stderr === "string" ? error.stderr.trim() : "";
+		const message = stderr || (error instanceof Error ? error.message : "");
+		const detail = message.split(/\r?\n/).find(Boolean);
+
+		if (detail)
+			console.log(`sccache at ${sccachePath} failed rustc probe: ${detail}`);
+		else console.log(`sccache at ${sccachePath} failed rustc probe`);
+
+		console.log("Using rustc directly");
+		return false;
+	} finally {
+		await fs.rm(probeDir, { recursive: true, force: true });
+	}
+}

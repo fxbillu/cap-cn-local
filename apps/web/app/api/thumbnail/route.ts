@@ -1,0 +1,114 @@
+import { db } from "@cap/database";
+import { videos } from "@cap/database/schema";
+import {
+	findScreenshotObjectKey,
+	provideOptionalAuth,
+	Storage,
+	VideosPolicy,
+} from "@cap/web-backend";
+import { Policy, Video } from "@cap/web-domain";
+import { eq } from "drizzle-orm";
+import { Effect, Exit } from "effect";
+import type { NextRequest } from "next/server";
+import * as EffectRuntime from "@/lib/server";
+import { runPromise } from "@/lib/server";
+import { decodeStorageVideo } from "@/lib/video-storage";
+import { getHeaders } from "@/utils/helpers";
+
+export async function GET(request: NextRequest) {
+	const { searchParams } = request.nextUrl;
+	const videoId = searchParams.get("videoId");
+	const origin = request.headers.get("origin") as string;
+
+	if (!videoId)
+		return new Response(
+			JSON.stringify({
+				error: true,
+				message: "userId or videoId not supplied",
+			}),
+			{
+				status: 400,
+				headers: getHeaders(origin),
+			},
+		);
+
+	const id = Video.VideoId.make(videoId);
+
+	// Gate on canView so private / password-protected videos' thumbnails are not
+	// exposed to unauthorized callers (owner, org/space members, public videos
+	// and password-protected videos with a valid cookie still pass).
+	const exit = await Effect.gen(function* () {
+		const videosPolicy = yield* VideosPolicy;
+		return yield* Effect.promise(() =>
+			db().select().from(videos).where(eq(videos.id, id)),
+		).pipe(Policy.withPublicPolicy(videosPolicy.canView(id)));
+	}).pipe(provideOptionalAuth, EffectRuntime.runPromiseExit);
+
+	if (Exit.isFailure(exit))
+		return new Response(
+			JSON.stringify({ error: true, message: "Video not found" }),
+			{
+				status: 404,
+				headers: getHeaders(origin),
+			},
+		);
+
+	const [query] = exit.value;
+
+	if (!query)
+		return new Response(
+			JSON.stringify({ error: true, message: "Video not found" }),
+			{
+				status: 404,
+				headers: getHeaders(origin),
+			},
+		);
+
+	const video = decodeStorageVideo(query);
+
+	const prefix = `${video.ownerId}/${video.id}/`;
+
+	try {
+		const [bucket] = await Storage.getAccessForVideo(video).pipe(runPromise);
+
+		const listResponse = await bucket
+			.listObjects({ prefix: prefix })
+			.pipe(runPromise);
+		const contents = listResponse.Contents || [];
+
+		const thumbnailKey = findScreenshotObjectKey(contents);
+
+		if (!thumbnailKey)
+			return new Response(
+				JSON.stringify({
+					error: true,
+					message: "No thumbnail found for this video",
+				}),
+				{
+					status: 404,
+					headers: getHeaders(origin),
+				},
+			);
+
+		const thumbnailUrl = await bucket
+			.getSignedObjectUrl(thumbnailKey)
+			.pipe(runPromise);
+
+		return new Response(JSON.stringify({ screen: thumbnailUrl }), {
+			status: 200,
+			headers: getHeaders(origin),
+		});
+	} catch (error) {
+		return new Response(
+			JSON.stringify({
+				error: true,
+				message: "Error generating thumbnail URL",
+				details: error instanceof Error ? error.message : "Unknown error",
+			}),
+			{
+				status: 500,
+				headers: getHeaders(origin),
+			},
+		);
+	}
+}

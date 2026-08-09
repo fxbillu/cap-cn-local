@@ -1,0 +1,82 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+.deepsec
+
+node_modules
+dist
+dist-ssr
+*.local
+.env
+.env.production
+.env.development
+.env.test
+target
+target-agent
+target-phase8
+outputs
+.cursorrules
+.github/hooks
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.turbo
+bun.lock
+pnpm-lock.yaml
+.zed
+.output
+.vinxi
+native-deps*
+apps/storybook/storybook-static
+.tinyb
+
+**/.tinyb
+
+*.tsbuildinfo
+.cargo/config.toml
+tauri.windows.conf.json
+tauri.macos.conf.json
+tauri.linux.conf.json
+.vercel
+
+# sst
+.sst
+
+# Cursor
+.cursor
+.env*.local
+.docs/
+.claude/
+.claude/settings.local.json
+
+# Release backfill scripts (one-time use)
+scripts/backfill-releases.sh
+scripts/update-github-releases.sh
+scripts/releases-backfill-data.txt
+
+# SEO agent state (machine-local, contains sensitive ranking data)
+/seo/
+scripts/seo/
+/docs/
+/.growth-agent/
+
+# OpenCode commands (local)
+.opencode/
+analysis/
+analysis/plans/
+.ralphy
+tmp/

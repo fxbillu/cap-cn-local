@@ -1,0 +1,1128 @@
+import { createTimer } from "@solid-primitives/timer";
+import { createMutation } from "@tanstack/solid-query";
+import { LogicalPosition } from "@tauri-apps/api/dpi";
+import {
+	CheckMenuItem,
+	Menu,
+	MenuItem,
+	PredefinedMenuItem,
+} from "@tauri-apps/api/menu";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { type as ostype } from "@tauri-apps/plugin-os";
+import { cx } from "cva";
+import {
+	type ComponentProps,
+	createEffect,
+	createMemo,
+	createSignal,
+	For,
+	onCleanup,
+	onMount,
+	Show,
+} from "solid-js";
+import { createStore, produce } from "solid-js/store";
+import { TransitionGroup } from "solid-transition-group";
+import { authStore } from "~/store";
+import { getCameraWindow } from "~/utils/camera-window";
+import { createTauriEventListener } from "~/utils/createEventListener";
+import * as dialog from "~/utils/dialog";
+import {
+	createCurrentRecordingQuery,
+	createOptionsQuery,
+} from "~/utils/queries";
+import { handleRecordingResult } from "~/utils/recording";
+import type {
+	CameraInfo,
+	CurrentRecording,
+	DeviceOrModelID,
+	RecordingInputKind,
+} from "~/utils/tauri";
+import { commands, events } from "~/utils/tauri";
+
+type State =
+	| { variant: "initializing" }
+	| { variant: "countdown"; from: number; current: number }
+	| { variant: "recording" }
+	| { variant: "paused" }
+	| { variant: "stopped" };
+
+type RecordingInputState = Record<RecordingInputKind, boolean>;
+
+declare global {
+	interface Window {
+		COUNTDOWN: number;
+	}
+}
+
+const MAX_RECORDING_FOR_FREE = 5 * 60 * 1000;
+const NO_MICROPHONE = "No Microphone";
+const NO_WEBCAM = "No Webcam";
+const FAKE_WINDOW_BOUNDS_NAME = "recording-controls-interactive-area";
+
+export default function () {
+	console.log("[in-progress-recording] Wrapper rendering");
+
+	document.documentElement.setAttribute("data-transparent-window", "true");
+	document.body.style.background = "transparent";
+
+	return <InProgressRecordingInner />;
+}
+
+function InProgressRecordingInner() {
+	console.log("[in-progress-recording] Inner component rendering");
+
+	const [state, setState] = createSignal<State>(
+		window.COUNTDOWN === 0
+			? { variant: "initializing" }
+			: {
+					variant: "countdown",
+					from: window.COUNTDOWN,
+					current: window.COUNTDOWN,
+				},
+	);
+	const [start, setStart] = createSignal(Date.now());
+	const [time, setTime] = createSignal(Date.now());
+	// When we last entered the "stopped" state. The reconcile effect compares
+	// this against the recording query's dataUpdatedAt so a refetch that is
+	// still in flight when a stop completes can't resurrect the old recording.
+	let stoppedAt = 0;
+	const markStopped = () => {
+		stoppedAt = Date.now();
+		setState({ variant: "stopped" });
+	};
+	const currentRecording = createCurrentRecordingQuery();
+	const optionsQuery = createOptionsQuery();
+	const startedWithMicrophone = optionsQuery.rawOptions.micName != null;
+	const startedWithCameraInput = optionsQuery.rawOptions.cameraID != null;
+
+	const [authData, setAuthData] = createSignal<{
+		plan?: { upgraded?: boolean };
+	} | null>(null);
+	onMount(() => {
+		authStore
+			.get()
+			.then(setAuthData)
+			.catch(() => setAuthData(null));
+	});
+
+	const audioLevel = createAudioInputLevel();
+	const [disconnectedInputs, setDisconnectedInputs] =
+		createStore<RecordingInputState>({ microphone: false, camera: false });
+	const [recordingFailure, setRecordingFailure] = createSignal<string | null>(
+		null,
+	);
+	const [degradedReason, setDegradedReason] = createSignal<string | null>(null);
+	const [issuePanelVisible, setIssuePanelVisible] = createSignal(false);
+	const [issueKey, setIssueKey] = createSignal("");
+	const [cameraWindowOpen, setCameraWindowOpen] = createSignal(false);
+	const [startingDismissed, setStartingDismissed] = createSignal(false);
+	const [stopRequested, setStopRequested] = createSignal(false);
+	const [teardownInFlight, setTeardownInFlight] = createSignal(false);
+	// Mirrors the backend's recording-scoped mic mute. The backend flag lives
+	// on the per-recording microphone lock, so every new recording starts
+	// unmuted — this signal must be reset wherever a new session begins.
+	const [micMuted, setMicMuted] = createSignal(false);
+	const [interactiveAreaRef, setInteractiveAreaRef] =
+		createSignal<HTMLDivElement | null>(null);
+	let settingsButtonRef: HTMLButtonElement | undefined;
+	let lastInteractiveBoundsKey = "";
+	let pendingInteractiveBoundsKey = "";
+	let interactiveBoundsDisposed = false;
+	const recordingMode = createMemo(
+		() => currentRecording.data?.mode ?? optionsQuery.rawOptions.mode,
+	);
+	const canPauseRecording = createMemo(() => {
+		const mode = recordingMode();
+		const os = ostype();
+		return (
+			mode === "studio" ||
+			os === "macos" ||
+			(os === "windows" && mode === "instant")
+		);
+	});
+
+	const _hasDisconnectedInput = () =>
+		disconnectedInputs.microphone || disconnectedInputs.camera;
+
+	const issueMessages = createMemo(() => {
+		const issues: string[] = [];
+		if (disconnectedInputs.microphone)
+			issues.push(
+				"Microphone disconnected. Silence will be used until it reconnects.",
+			);
+		if (disconnectedInputs.camera)
+			issues.push(
+				"Camera disconnected. Recording continues without camera overlay.",
+			);
+		const failure = recordingFailure();
+		if (failure) issues.push(failure);
+		return issues;
+	});
+
+	const hasRecordingIssue = () => issueMessages().length > 0;
+
+	const toggleIssuePanel = () => {
+		if (!hasRecordingIssue()) return;
+		setIssuePanelVisible((visible) => !visible);
+	};
+
+	const dismissIssuePanel = () => setIssuePanelVisible(false);
+	const hasCameraInput = () => optionsQuery.rawOptions.cameraID != null;
+	const microphoneTitle = createMemo(() => {
+		if (disconnectedInputs.microphone) return "Microphone disconnected";
+		if (optionsQuery.rawOptions.micName)
+			return `Microphone: ${optionsQuery.rawOptions.micName}`;
+		return "Microphone not configured";
+	});
+
+	const [pauseResumes, setPauseResumes] = createStore<
+		| []
+		| [
+				...Array<{ pause: number; resume?: number }>,
+				{ pause: number; resume?: number },
+		  ]
+	>([]);
+
+	createEffect(() => {
+		const messages = issueMessages();
+		if (messages.length === 0) {
+			setIssueKey("");
+			setIssuePanelVisible(false);
+			return;
+		}
+		const nextKey = messages.join("||");
+		if (nextKey !== issueKey()) {
+			setIssueKey(nextKey);
+			setIssuePanelVisible(true);
+		}
+	});
+
+	createTauriEventListener(events.recordingEvent, (payload) => {
+		switch (payload.variant) {
+			case "Countdown":
+				setStartingDismissed(false);
+				setDisconnectedInputs({ microphone: false, camera: false });
+				setRecordingFailure(null);
+				setDegradedReason(null);
+				setPauseResumes([]);
+				setStopRequested(false);
+				setMicMuted(false);
+				setState({
+					variant: "countdown",
+					from: payload.value,
+					current: payload.value,
+				});
+				break;
+			case "Started": {
+				const wasStartingDismissed = startingDismissed();
+				setStartingDismissed(false);
+				setDisconnectedInputs({ microphone: false, camera: false });
+				setRecordingFailure(null);
+				setDegradedReason(null);
+				setPauseResumes([]);
+				setStopRequested(false);
+				setMicMuted(false);
+				aborted = false;
+				// This window is reused across recordings, so `start`/`time` still
+				// hold the previous session's values here. Effects (the free-plan
+				// length limit) run synchronously on the state flip below, so the
+				// timestamps must be reset first or the new recording gets measured
+				// against the old session and stopped immediately.
+				setStart(Date.now());
+				setTime(Date.now());
+				setState({ variant: "recording" });
+				if (wasStartingDismissed) {
+					void getCurrentWindow().show();
+				}
+				break;
+			}
+			case "Paused":
+				if (state().variant === "recording") {
+					setPauseResumes((a) => [...a, { pause: Date.now() }]);
+				}
+				setState({ variant: "paused" });
+				setTime(Date.now());
+				break;
+			case "Resumed":
+				setPauseResumes(
+					produce((a) => {
+						if (a.length === 0) return a;
+						a[a.length - 1].resume = Date.now();
+					}),
+				);
+				setState({ variant: "recording" });
+				setTime(Date.now());
+				break;
+			case "InputLost": {
+				setDisconnectedInputs(payload.input, () => true);
+				break;
+			}
+			case "InputRestored":
+				setDisconnectedInputs(payload.input, () => false);
+				break;
+			case "Failed":
+				setRecordingFailure(payload.error);
+				break;
+			case "Degraded": {
+				const p = payload as { variant: "Degraded"; reason: string };
+				setDegradedReason(p.reason);
+				break;
+			}
+			case "Recovered":
+				setDegradedReason(null);
+				break;
+		}
+	});
+
+	// A recording can end outside this window: the main window's stop button,
+	// the tray, a global shortcut, or a mid-recording failure. The switch above
+	// never resets state for those (RecordingEvent::Stopped exists but comes
+	// from a racing wait-actor and can land mid-restart, so it is deliberately
+	// not handled). RecordingStopped is only emitted after the recording state
+	// clears and strictly before any next recording can start, making it the
+	// safe reset signal — without it this reused window keeps ticking a phantom
+	// session that poisons the next recording's elapsed-time checks.
+	createTauriEventListener(events.recordingStopped, () => {
+		// Restart/delete drive their own state while the discarded recording
+		// tears down; the stop mutation marks stopped itself once it resolves.
+		if (teardownInFlight()) return;
+		markStopped();
+	});
+
+	createEffect(() => {
+		// While restart/delete teardown is running the query data is stale;
+		// reconciling against it would resurrect the discarded recording's state.
+		if (teardownInFlight()) return;
+
+		const s = state();
+		const recording = currentRecording.data as
+			| CurrentRecording
+			| null
+			| undefined;
+
+		if (s.variant === "stopped" && !currentRecording.isPending && recording) {
+			// Only trust data fetched after we entered "stopped". The stop
+			// command resolves before the invalidated query can refetch (the
+			// backend holds the recording state lock until the command returns),
+			// so `data` here can still describe the recording that just ended.
+			// Resurrecting from it would leave this reused window in a phantom
+			// "recording" state, with the timer running against a dead session.
+			// (dataUpdatedAt marks fetch resolution, not the snapshot, so a
+			// fetch dispatched pre-stop can slip through — the fresh start/time
+			// set below keeps even that phantom harmless to the next session.)
+			if (currentRecording.dataUpdatedAt <= stoppedAt) return;
+			setStartingDismissed(false);
+			setDisconnectedInputs({ microphone: false, camera: false });
+			setRecordingFailure(null);
+			setDegradedReason(null);
+			setPauseResumes([]);
+			setStopRequested(false);
+			setMicMuted(false);
+			aborted = false;
+			if (recording.status === "recording") {
+				setStart(Date.now());
+				setTime(Date.now());
+				setState({ variant: "recording" });
+			} else {
+				setState({ variant: "initializing" });
+			}
+			return;
+		}
+
+		if (s.variant !== "initializing" && s.variant !== "countdown") return;
+		if (currentRecording.isPending) return;
+		if (recording?.status === "recording") {
+			setStartingDismissed(false);
+			setDisconnectedInputs({ microphone: false, camera: false });
+			setRecordingFailure(null);
+			setDegradedReason(null);
+			setPauseResumes([]);
+			setMicMuted(false);
+			aborted = false;
+			setStart(Date.now());
+			setTime(Date.now());
+			setState({ variant: "recording" });
+			return;
+		}
+		if (s.variant === "initializing" && !recording) {
+			markStopped();
+			void getCurrentWindow().hide();
+		}
+	});
+
+	createTimer(
+		() => {
+			if (state().variant !== "recording") return;
+			setTime(Date.now());
+		},
+		100,
+		setInterval,
+	);
+	const refreshCameraWindowState = async () => {
+		try {
+			setCameraWindowOpen(await commands.isCameraWindowOpen());
+		} catch {
+			setCameraWindowOpen(false);
+		}
+	};
+
+	createEffect(() => {
+		void refreshCameraWindowState();
+	});
+
+	const syncInteractiveAreaBounds = () => {
+		if (interactiveBoundsDisposed) return;
+
+		const element = interactiveAreaRef();
+		if (!element) {
+			if (lastInteractiveBoundsKey !== "") {
+				lastInteractiveBoundsKey = "";
+				pendingInteractiveBoundsKey = "";
+				void commands.removeFakeWindow(FAKE_WINDOW_BOUNDS_NAME);
+			}
+			return;
+		}
+
+		const rect = element.getBoundingClientRect();
+		if (rect.width === 0 || rect.height === 0) return;
+
+		const key = [rect.left, rect.top, rect.width, rect.height]
+			.map((value) => value.toFixed(2))
+			.join(":");
+		if (key === lastInteractiveBoundsKey) return;
+		if (pendingInteractiveBoundsKey !== "") return;
+
+		pendingInteractiveBoundsKey = key;
+		const bounds = {
+			position: { x: rect.left, y: rect.top },
+			size: { width: rect.width, height: rect.height },
+		};
+		void commands
+			.setFakeWindowBounds(FAKE_WINDOW_BOUNDS_NAME, bounds)
+			.then(() => {
+				if (interactiveBoundsDisposed) {
+					void commands.removeFakeWindow(FAKE_WINDOW_BOUNDS_NAME);
+					return;
+				}
+
+				lastInteractiveBoundsKey = key;
+			})
+			.catch((error) => {
+				console.error("Failed to sync recording controls hit area", error);
+			})
+			.finally(() => {
+				if (pendingInteractiveBoundsKey === key)
+					pendingInteractiveBoundsKey = "";
+			});
+	};
+
+	createEffect(() => {
+		interactiveAreaRef();
+		queueMicrotask(syncInteractiveAreaBounds);
+	});
+
+	createEffect(() => {
+		state();
+		issuePanelVisible();
+		queueMicrotask(syncInteractiveAreaBounds);
+	});
+
+	onCleanup(() => {
+		interactiveBoundsDisposed = true;
+		lastInteractiveBoundsKey = "";
+		pendingInteractiveBoundsKey = "";
+		void commands.removeFakeWindow(FAKE_WINDOW_BOUNDS_NAME);
+	});
+
+	onMount(() => {
+		const onResize = () => syncInteractiveAreaBounds();
+		window.addEventListener("resize", onResize);
+		onCleanup(() => window.removeEventListener("resize", onResize));
+		requestAnimationFrame(() => syncInteractiveAreaBounds());
+		setTimeout(() => syncInteractiveAreaBounds(), 150);
+	});
+
+	createTimer(
+		() => {
+			void refreshCameraWindowState();
+		},
+		2000,
+		setInterval,
+	);
+
+	createTimer(syncInteractiveAreaBounds, 250, setInterval);
+
+	createEffect(() => {
+		if (
+			state().variant === "stopped" &&
+			!currentRecording.isPending &&
+			(currentRecording.data === undefined || currentRecording.data === null)
+		)
+			getCurrentWindow().hide();
+	});
+
+	const stopRecording = createMutation(() => ({
+		mutationFn: async () => {
+			setStopRequested(true);
+			await commands.stopRecording();
+			markStopped();
+			void getCurrentWindow().hide();
+		},
+		onError: () => {
+			setStopRequested(false);
+		},
+	}));
+
+	const requestStopRecording = () => {
+		if (isCountdown() || stopRequested() || stopRecording.isPending) return;
+		stopRecording.mutate();
+	};
+
+	const togglePause = createMutation(() => ({
+		mutationFn: async () => {
+			if (state().variant === "paused") {
+				await commands.resumeRecording();
+			} else {
+				await commands.pauseRecording();
+			}
+		},
+	}));
+
+	// Muting zeroes the mic samples backend-side while the stream keeps its
+	// normal cadence, so the recording timeline is unaffected. Only exposed for
+	// instant mode: studio records the mic as an editable track, where muted
+	// spans would silently bake zeros into it.
+	const canToggleMicMute = createMemo(
+		() =>
+			recordingMode() === "instant" &&
+			optionsQuery.rawOptions.micName != null &&
+			!disconnectedInputs.microphone &&
+			(state().variant === "recording" || state().variant === "paused"),
+	);
+
+	const toggleMicMute = createMutation(() => ({
+		mutationFn: async () => {
+			const next = !micMuted();
+			setMicMuted(next);
+			try {
+				await commands.setMicRecordingMuted(next);
+			} catch (error) {
+				setMicMuted(!next);
+				throw error;
+			}
+		},
+	}));
+
+	const restartRecording = createMutation(() => ({
+		mutationFn: async () => {
+			const shouldRestart = await dialog.confirm(
+				"Are you sure you want to restart the recording? The current recording will be discarded.",
+				{ title: "Confirm Restart", okLabel: "Restart", cancelLabel: "Cancel" },
+			);
+
+			if (!shouldRestart) return;
+
+			setTeardownInFlight(true);
+			setState({ variant: "initializing" });
+			try {
+				await handleRecordingResult(commands.restartRecording(), undefined);
+			} finally {
+				setTeardownInFlight(false);
+			}
+		},
+	}));
+
+	const deleteRecording = createMutation(() => ({
+		mutationFn: async () => {
+			const shouldDelete = await dialog.confirm(
+				"Are you sure you want to delete the recording?",
+				{ title: "Confirm Delete", okLabel: "Delete", cancelLabel: "Cancel" },
+			);
+
+			if (!shouldDelete) return;
+
+			setTeardownInFlight(true);
+			markStopped();
+			void getCurrentWindow().hide();
+			try {
+				await commands.deleteRecording();
+			} finally {
+				setTeardownInFlight(false);
+			}
+		},
+	}));
+
+	const toggleCameraPreview = createMutation(() => ({
+		mutationFn: async () => {
+			if (cameraWindowOpen()) {
+				const cameraWindow = await getCameraWindow();
+				if (cameraWindow) await cameraWindow.close();
+			} else {
+				await commands.showWindow({ Camera: { centered: false } });
+			}
+			await refreshCameraWindowState();
+		},
+	}));
+
+	const pauseRecordingForDeviceChange = async () => {
+		if (state().variant !== "recording") return false;
+		await commands.pauseRecording();
+		return true;
+	};
+
+	const updateMicInput = createMutation(() => ({
+		mutationFn: async (name: string | null) => {
+			if (!startedWithMicrophone && name !== null) return;
+			const previous = optionsQuery.rawOptions.micName ?? null;
+			if (previous === name) return;
+			await pauseRecordingForDeviceChange();
+			optionsQuery.setOptions("micName", name);
+			try {
+				await commands.setMicInput(name);
+			} catch (error) {
+				optionsQuery.setOptions("micName", previous);
+				throw error;
+			}
+		},
+	}));
+
+	const updateCameraInput = createMutation(() => ({
+		mutationFn: async (camera: CameraInfo | null) => {
+			if (!startedWithCameraInput && camera != null) return;
+			const selected = optionsQuery.rawOptions.cameraID ?? null;
+			if (!camera && selected === null) return;
+			if (camera && cameraMatchesSelection(camera, selected)) return;
+			await pauseRecordingForDeviceChange();
+			const next = cameraInfoToId(camera);
+			const previous = cloneDeviceOrModelId(selected);
+			optionsQuery.setOptions("cameraID", next);
+			try {
+				await commands.setCameraInput(next, null);
+				if (!next && cameraWindowOpen()) {
+					const cameraWindow = await getCameraWindow();
+					if (cameraWindow) await cameraWindow.close();
+					await refreshCameraWindowState();
+				}
+			} catch (error) {
+				optionsQuery.setOptions("cameraID", previous);
+				throw error;
+			}
+		},
+	}));
+
+	const openRecordingSettingsMenu = async () => {
+		try {
+			let audioDevices: string[] = [];
+			let videoDevices: CameraInfo[] = [];
+			try {
+				audioDevices = await commands.listAudioDevices();
+			} catch {
+				audioDevices = [];
+			}
+			try {
+				videoDevices = await commands.listCameras();
+			} catch {
+				videoDevices = [];
+			}
+			const items: (
+				| Awaited<ReturnType<typeof CheckMenuItem.new>>
+				| Awaited<ReturnType<typeof MenuItem.new>>
+				| Awaited<ReturnType<typeof PredefinedMenuItem.new>>
+			)[] = [];
+			items.push(
+				await CheckMenuItem.new({
+					text: "Show Camera Preview",
+					checked: cameraWindowOpen(),
+					enabled: startedWithCameraInput && hasCameraInput(),
+					action: () => {
+						if (!startedWithCameraInput || !hasCameraInput()) return;
+						toggleCameraPreview.mutate();
+					},
+				}),
+			);
+			items.push(await PredefinedMenuItem.new({ item: "Separator" }));
+			items.push(
+				await MenuItem.new({
+					text: startedWithMicrophone
+						? "Microphone"
+						: "Microphone (locked for this recording)",
+					enabled: false,
+				}),
+			);
+			items.push(
+				await CheckMenuItem.new({
+					text: NO_MICROPHONE,
+					checked: optionsQuery.rawOptions.micName == null,
+					enabled: startedWithMicrophone,
+					action: () => updateMicInput.mutate(null),
+				}),
+			);
+			for (const name of audioDevices) {
+				items.push(
+					await CheckMenuItem.new({
+						text: name,
+						checked: optionsQuery.rawOptions.micName === name,
+						enabled: startedWithMicrophone,
+						action: () => updateMicInput.mutate(name),
+					}),
+				);
+			}
+			items.push(await PredefinedMenuItem.new({ item: "Separator" }));
+			items.push(
+				await MenuItem.new({
+					text: startedWithCameraInput
+						? "Webcam"
+						: "Webcam (locked for this recording)",
+					enabled: false,
+				}),
+			);
+			items.push(
+				await CheckMenuItem.new({
+					text: NO_WEBCAM,
+					checked: !hasCameraInput(),
+					enabled: startedWithCameraInput,
+					action: () => updateCameraInput.mutate(null),
+				}),
+			);
+			for (const camera of videoDevices) {
+				items.push(
+					await CheckMenuItem.new({
+						text: camera.display_name,
+						checked: cameraMatchesSelection(
+							camera,
+							optionsQuery.rawOptions.cameraID ?? null,
+						),
+						enabled: startedWithCameraInput,
+						action: () => updateCameraInput.mutate(camera),
+					}),
+				);
+			}
+			const menu = await Menu.new({ items });
+			const rect = settingsButtonRef?.getBoundingClientRect();
+			if (rect)
+				menu.popup(new LogicalPosition(rect.x, rect.y + rect.height + 4));
+			else menu.popup();
+		} catch (error) {
+			console.error("Failed to open recording settings menu", error);
+		}
+	};
+
+	const adjustedTime = () => {
+		if (state().variant === "countdown" || state().variant === "initializing")
+			return 0;
+		let t = time() - start();
+		for (const { pause, resume } of pauseResumes) {
+			if (pause && resume) t -= resume - pause;
+		}
+		return Math.max(0, t);
+	};
+
+	const isMaxRecordingLimitEnabled = () => {
+		// Only enforce the limit on instant mode.
+		// We enforce it on studio mode when exporting.
+		return (
+			optionsQuery.rawOptions.mode === "instant" &&
+			// If the data is loaded and the user is not upgraded
+			authData()?.plan?.upgraded === false
+		);
+	};
+
+	let aborted = false;
+	createEffect(() => {
+		// Only a live session may trip the limit; in the other variants
+		// `time`/`start` are leftovers from a previous recording in this
+		// reused window and must never trigger a stop.
+		const variant = state().variant;
+		if (variant !== "recording" && variant !== "paused") return;
+		if (
+			isMaxRecordingLimitEnabled() &&
+			adjustedTime() > MAX_RECORDING_FOR_FREE &&
+			!aborted
+		) {
+			aborted = true;
+			stopRecording.mutate();
+		}
+	});
+
+	const remainingRecordingTime = () => {
+		if (MAX_RECORDING_FOR_FREE < adjustedTime()) return 0;
+		return MAX_RECORDING_FOR_FREE - adjustedTime();
+	};
+
+	const isInitializing = () => state().variant === "initializing";
+	const closeStartingBar = async () => {
+		setStartingDismissed(true);
+		markStopped();
+		await getCurrentWindow().hide();
+	};
+	const isCountdown = () => state().variant === "countdown";
+	const countdownCurrent = () => {
+		const s = state();
+		return s.variant === "countdown" ? s.current : 0;
+	};
+
+	return (
+		<div class="flex h-full w-full flex-col justify-end px-3 pb-3">
+			<div ref={setInteractiveAreaRef} class="flex w-full flex-col gap-2">
+				<Show when={hasRecordingIssue() && issuePanelVisible()}>
+					<div class="flex w-full flex-row items-start gap-3 rounded-2xl border border-red-8 bg-gray-1 px-4 py-3 text-[12px] leading-snug text-red-11 shadow-lg">
+						<IconLucideAlertTriangle class="mt-0.5 size-5 text-red-9" />
+						<div class="flex-1 space-y-1">
+							{issueMessages().map((message) => (
+								<p>{message}</p>
+							))}
+						</div>
+						<button
+							type="button"
+							class="text-red-9 transition hover:text-red-11"
+							onClick={() => dismissIssuePanel()}
+							aria-label="Dismiss recording issue"
+						>
+							<IconLucideX class="size-4" />
+						</button>
+					</div>
+				</Show>
+				<div class="h-10 w-full rounded-2xl">
+					<div class="flex h-full w-full flex-row items-stretch overflow-hidden rounded-2xl bg-gray-1 border border-gray-5 shadow-[0_1px_3px_rgba(0,0,0,0.1)]">
+						<div class="flex flex-1 flex-col gap-2 p-1">
+							<div class="flex flex-1 flex-row justify-between">
+								<Show
+									when={!isInitializing()}
+									fallback={
+										<div class="flex flex-row items-center gap-1.5 rounded-lg py-1 px-2 text-gray-12">
+											<IconLucideLoader2 class="size-4 animate-spin" />
+											<span class="text-[0.875rem] font-medium tabular-nums">
+												Starting
+											</span>
+										</div>
+									}
+								>
+									<button
+										disabled={
+											stopRequested() ||
+											stopRecording.isPending ||
+											isCountdown()
+										}
+										class="flex flex-row items-center gap-1 rounded-lg py-1 px-2 text-red-300 transition-colors duration-100 hover:bg-red-500/8 active:bg-red-500/12 disabled:opacity-60 disabled:hover:bg-transparent"
+										type="button"
+										onPointerDown={(event) => {
+											if (event.button !== 0) return;
+											event.preventDefault();
+											event.stopPropagation();
+											requestStopRecording();
+										}}
+										onClick={requestStopRecording}
+										title="Stop recording"
+										aria-label="Stop recording"
+									>
+										<IconCapStopCircle />
+										<span class="text-[0.875rem] font-medium tabular-nums">
+											<Show
+												when={!isCountdown()}
+												fallback={
+													<div class="relative inline-block h-[1.5em] w-[1ch] overflow-hidden align-middle">
+														<TransitionGroup
+															onEnter={(el, done) => {
+																const a = el.animate(
+																	[
+																		{
+																			opacity: 0,
+																			transform: "translateY(-100%)",
+																		},
+																		{ opacity: 1, transform: "translateY(0)" },
+																	],
+																	{
+																		duration: 300,
+																		easing: "cubic-bezier(0.16, 1, 0.3, 1)",
+																	},
+																);
+																a.finished.then(done);
+															}}
+															onExit={(el, done) => {
+																const a = el.animate(
+																	[
+																		{ opacity: 1, transform: "translateY(0)" },
+																		{
+																			opacity: 0,
+																			transform: "translateY(100%)",
+																		},
+																	],
+																	{
+																		duration: 300,
+																		easing: "cubic-bezier(0.16, 1, 0.3, 1)",
+																	},
+																);
+																a.finished.then(done);
+															}}
+														>
+															<For each={[countdownCurrent()]}>
+																{(num) => (
+																	<span class="absolute inset-0 flex items-center justify-center">
+																		{num}
+																	</span>
+																)}
+															</For>
+														</TransitionGroup>
+													</div>
+												}
+											>
+												<Show
+													when={isMaxRecordingLimitEnabled()}
+													fallback={formatTime(adjustedTime() / 1000)}
+												>
+													{formatTime(remainingRecordingTime() / 1000)}
+												</Show>
+											</Show>
+										</span>
+									</button>
+								</Show>
+
+								<div class="flex items-center gap-1">
+									<Show
+										when={canToggleMicMute()}
+										fallback={
+											<div
+												class="relative flex h-8 w-8 items-center justify-center"
+												title={microphoneTitle()}
+											>
+												{optionsQuery.rawOptions.micName != null ? (
+													disconnectedInputs.microphone ? (
+														<IconLucideMicOff class="size-5 text-amber-11" />
+													) : (
+														<>
+															<IconCapMicrophone class="size-5 text-gray-12" />
+															<div class="absolute bottom-1 left-1 right-1 h-0.5 overflow-hidden rounded-full bg-gray-10">
+																<div
+																	class="absolute inset-0 bg-blue-9 transition-transform duration-100"
+																	style={{
+																		transform: `translateX(-${
+																			(1 - audioLevel()) * 100
+																		}%)`,
+																	}}
+																/>
+															</div>
+														</>
+													)
+												) : (
+													<IconLucideMicOff
+														class="size-5 text-gray-7"
+														data-tauri-drag-region
+													/>
+												)}
+											</div>
+										}
+									>
+										<button
+											type="button"
+											class="relative flex h-8 w-8 items-center justify-center rounded-lg transition-colors duration-100 hover:bg-gray-12/6 active:bg-gray-12/10 disabled:opacity-50 disabled:hover:bg-transparent dark:hover:bg-white/8 dark:active:bg-white/12"
+											disabled={toggleMicMute.isPending}
+											onClick={() => toggleMicMute.mutate()}
+											title={
+												micMuted() ? "Unmute microphone" : "Mute microphone"
+											}
+											aria-pressed={micMuted() ? "true" : "false"}
+											aria-label={
+												micMuted() ? "Unmute microphone" : "Mute microphone"
+											}
+										>
+											{micMuted() ? (
+												<IconLucideMicOff class="size-5 text-red-9" />
+											) : (
+												<>
+													<IconCapMicrophone class="size-5 text-gray-12" />
+													<div class="absolute bottom-1 left-1 right-1 h-0.5 overflow-hidden rounded-full bg-gray-10">
+														<div
+															class="absolute inset-0 bg-blue-9 transition-transform duration-100"
+															style={{
+																transform: `translateX(-${
+																	(1 - audioLevel()) * 100
+																}%)`,
+															}}
+														/>
+													</div>
+												</>
+											)}
+										</button>
+									</Show>
+									<Show when={hasCameraInput() && disconnectedInputs.camera}>
+										<div
+											class="flex h-8 w-8 items-center justify-center"
+											title="Camera disconnected - recording continues without camera overlay"
+										>
+											<IconLucideVideoOff class="size-5 text-amber-11" />
+										</div>
+									</Show>
+									<Show when={degradedReason()}>
+										{(reason) => (
+											<div
+												class="flex h-8 w-8 items-center justify-center"
+												title={reason()}
+												aria-label="Recording quality degraded"
+											>
+												<div class="size-2 rounded-full bg-amber-9 animate-pulse" />
+											</div>
+										)}
+									</Show>
+									<Show
+										when={!isInitializing()}
+										fallback={
+											<ActionButton
+												onClick={() => {
+													void closeStartingBar();
+												}}
+												title="Close recording controls"
+												aria-label="Close recording controls"
+											>
+												<IconLucideX class="size-5" />
+											</ActionButton>
+										}
+									>
+										<Show when={hasRecordingIssue()}>
+											<ActionButton
+												class={cx(
+													"text-red-10 hover:bg-red-3/40",
+													issuePanelVisible() &&
+														"bg-red-3/40 ring-1 ring-red-8",
+												)}
+												onClick={() => toggleIssuePanel()}
+												title={issueMessages().join(", ")}
+												aria-pressed={issuePanelVisible() ? "true" : "false"}
+												aria-label="Recording issues"
+											>
+												<IconLucideAlertTriangle class="size-5" />
+											</ActionButton>
+										</Show>
+
+										{canPauseRecording() && (
+											<ActionButton
+												disabled={togglePause.isPending || isCountdown()}
+												onClick={() => togglePause.mutate()}
+												title={
+													state().variant === "paused"
+														? "Resume recording"
+														: "Pause recording"
+												}
+												aria-label={
+													state().variant === "paused"
+														? "Resume recording"
+														: "Pause recording"
+												}
+											>
+												{state().variant === "paused" ? (
+													<IconCapPlayCircle />
+												) : (
+													<IconCapPauseCircle />
+												)}
+											</ActionButton>
+										)}
+
+										<ActionButton
+											disabled={restartRecording.isPending || isCountdown()}
+											onClick={() => restartRecording.mutate()}
+											title="Restart recording"
+											aria-label="Restart recording"
+										>
+											<IconCapRestart />
+										</ActionButton>
+										<ActionButton
+											disabled={deleteRecording.isPending || isCountdown()}
+											onClick={() => deleteRecording.mutate()}
+											title="Delete recording"
+											aria-label="Delete recording"
+										>
+											<IconCapTrash />
+										</ActionButton>
+										<ActionButton
+											ref={(el) => {
+												settingsButtonRef = el ?? undefined;
+											}}
+											onClick={() => {
+												void openRecordingSettingsMenu();
+											}}
+											title="Recording settings"
+											aria-label="Recording settings"
+										>
+											<IconCapSettings class="size-5" />
+										</ActionButton>
+									</Show>
+								</div>
+							</div>
+						</div>
+						<div
+							class="non-styled-move flex cursor-move items-center justify-center border-l border-gray-5 p-1 hover:cursor-move transition-colors duration-100 hover:bg-gray-12/4 dark:hover:bg-white/6"
+							data-tauri-drag-region
+						>
+							<IconCapMoreVertical class="pointer-events-none text-gray-10" />
+						</div>
+					</div>
+				</div>
+			</div>
+		</div>
+	);
+}
+
+function ActionButton(props: ComponentProps<"button">) {
+	return (
+		<button
+			{...props}
+			class={cx(
+				"p-1 rounded-lg transition-colors duration-100",
+				"text-gray-11 hover:text-gray-12",
+				"hover:bg-gray-12/6 dark:hover:bg-white/8",
+				"active:bg-gray-12/10 dark:active:bg-white/12",
+				"h-8 w-8 flex items-center justify-center",
+				"disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:bg-transparent",
+				props.class,
+			)}
+			type="button"
+		/>
+	);
+}
+
+function formatTime(secs: number) {
+	const minutes = Math.floor(secs / 60);
+	const seconds = Math.floor(secs % 60);
+
+	return `${minutes}:${seconds.toString().padStart(2, "0")}`;
+}
+
+function createAudioInputLevel() {
+	const [level, setLevel] = createSignal(0);
+
+	createTauriEventListener(events.audioInputLevelChange, (dbs) => {
+		const DB_MIN = -60;
+		const DB_MAX = 0;
+
+		const dbValue = dbs ?? DB_MIN;
+		const normalizedLevel = Math.max(
+			0,
+			Math.min(1, (dbValue - DB_MIN) / (DB_MAX - DB_MIN)),
+		);
+		setLevel(normalizedLevel);
+	});
+
+	return level;
+}
+
+function cameraMatchesSelection(
+	camera: CameraInfo,
+	selected?: DeviceOrModelID | null,
+) {
+	if (!selected) return false;
+	if ("DeviceID" in selected) return selected.DeviceID === camera.device_id;
+	return camera.model_id != null && selected.ModelID === camera.model_id;
+}
+
+function cameraInfoToId(camera: CameraInfo | null): DeviceOrModelID | null {
+	if (!camera) return null;
+	if (camera.model_id) return { ModelID: camera.model_id };
+	return { DeviceID: camera.device_id };
+}
+
+function cloneDeviceOrModelId(
+	id: DeviceOrModelID | null,
+): DeviceOrModelID | null {
+	if (!id) return null;
+	if ("DeviceID" in id) return { DeviceID: id.DeviceID };
+	return { ModelID: id.ModelID };
+}

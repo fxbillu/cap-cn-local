@@ -1,0 +1,78 @@
+name: Build Cap Chinese Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_url:
+        description: Default Cap Web server URL
+        required: true
+        default: https://cap.so
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@1.88.0
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Configure Rust cache
+        uses: ./.github/actions/setup-rust-cache
+        with:
+          target: x86_64-pc-windows-msvc
+
+      - name: Install JavaScript dependencies
+        uses: ./.github/actions/setup-js
+
+      - name: Verify Chinese catalog
+        run: pnpm desktop:i18n:check
+
+      - name: Create build environment
+        shell: bash
+        env:
+          CAP_CN_SERVER_URL: ${{ inputs.server_url }}
+        run: |
+          {
+            echo "VITE_ENVIRONMENT=production"
+            echo "NEXT_PUBLIC_WEB_URL=$CAP_CN_SERVER_URL"
+            echo "NEXTAUTH_URL=$CAP_CN_SERVER_URL"
+            echo "VITE_SERVER_URL=$CAP_CN_SERVER_URL"
+            echo "RUST_TARGET_TRIPLE=x86_64-pc-windows-msvc"
+          } >> .env
+
+      - name: Prepare Cap workspace
+        run: pnpm -w cap-setup
+        env:
+          RUST_TARGET_TRIPLE: x86_64-pc-windows-msvc
+
+      - name: Build desktop sidecars
+        shell: bash
+        run: ./scripts/build-desktop-binaries.sh x86_64-pc-windows-msvc
+
+      - name: Increase Windows pagefile
+        uses: al-cheb/configure-pagefile-action@a3b6ebd6b634da88790d9c58d4b37a7b8708
+        with:
+          minimum-size: 16GB
+          maximum-size: 24GB
+          disk-root: "D:"
+
+      - name: Build unsigned NSIS installer
+        working-directory: apps/desktop
+        run: pnpm build:tauri --target x86_64-pc-windows-msvc --config src-tauri/tauri.prod.conf.json --config src-tauri/tauri.cn.conf.json --bundles nsis
+        env:
+          CI: false
+          RUST_TARGET_TRIPLE: x86_64-pc-windows-msvc
+
+      - name: Upload Windows installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: cap-cn-windows-x64
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
