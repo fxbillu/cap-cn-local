@@ -52,16 +52,16 @@ jobs:
         env:
           RUST_TARGET_TRIPLE: x86_64-pc-windows-msvc
 
-      - name: Build desktop sidecars
-        shell: bash
-        run: ./scripts/build-desktop-binaries.sh x86_64-pc-windows-msvc
-
       - name: Increase Windows pagefile
         uses: al-cheb/configure-pagefile-action@9b6da52fb72a3c6147c1aad2df22d8d905681adc
         with:
           minimum-size: 16GB
           maximum-size: 24GB
           disk-root: "D:"
+
+      - name: Build desktop sidecars
+        shell: bash
+        run: ./scripts/build-desktop-binaries.sh x86_64-pc-windows-msvc
 
       - name: Build unsigned NSIS installer
         working-directory: apps/desktop
