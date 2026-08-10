@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">Cap 中文构建</title>
+  <desc id="desc">面向 macOS Apple Silicon 与 Windows x64 的非官方简体中文 Cap 桌面构建。</desc>
+  <rect width="1200" height="360" rx="28" fill="#101827"/>
+  <path d="M0 290H1200M770 0V360" stroke="#25334a" stroke-width="2"/>
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif">
+    <text x="64" y="76" fill="#8da2c0" font-size="18" font-weight="700" letter-spacing="2">UNOFFICIAL SIMPLIFIED CHINESE BUILD</text>
+    <text x="64" y="148" fill="#f7f9fc" font-size="60" font-weight="750">Cap 中文构建</text>
+    <text x="64" y="194" fill="#c3cfdf" font-size="25">屏幕录制、编辑与本地导出 · macOS 与 Windows</text>
+    <rect x="64" y="236" width="255" height="48" rx="24" fill="#e8f0ff"/>
+    <text x="92" y="267" fill="#172238" font-size="19" font-weight="700">macOS Apple Silicon</text>
+    <rect x="334" y="236" width="175" height="48" rx="24" fill="#23334d" stroke="#526988"/>
+    <text x="367" y="267" fill="#e4ebf7" font-size="19" font-weight="700">Windows x64</text>
+    <text x="64" y="326" fill="#8da2c0" font-size="16">未签名构建 · 不代表 Cap Software 官方产品</text>
+  </g>
+  <rect x="836" y="52" width="294" height="194" rx="18" fill="#18263a" stroke="#536b8d" stroke-width="2"/>
+  <rect x="854" y="70" width="258" height="25" rx="8" fill="#253852"/>
+  <circle cx="870" cy="82" r="5" fill="#ff6b6b"/>
+  <circle cx="886" cy="82" r="5" fill="#f7c65a"/>
+  <circle cx="902" cy="82" r="5" fill="#5bd68b"/>
+  <rect x="868" y="116" width="230" height="92" rx="12" fill="#0d1523"/>
+  <path d="M888 184L940 154L978 174L1026 134L1078 184" fill="none" stroke="#79a8ff" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="1026" cy="134" r="10" fill="#a7c5ff"/>
+  <rect x="868" y="221" width="92" height="10" rx="5" fill="#7699cf"/>
+  <rect x="972" y="221" width="62" height="10" rx="5" fill="#364d70"/>
+  <circle cx="882" cy="280" r="10" fill="#ff5d62"/>
+  <text x="902" y="286" fill="#f7f9fc" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="18" font-weight="700">REC</text>
+  <path d="M977 280H1052" stroke="#6388bd" stroke-width="3" stroke-linecap="round"/>
+  <text x="1070" y="286" fill="#a9bad2" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', sans-serif" font-size="16">编辑</text>
+</svg>

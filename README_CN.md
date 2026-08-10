@@ -1,9 +1,11 @@
-# Cap Windows 中文分支
+# Cap 中文构建：详细说明
 
-这是基于 [CapSoftware/Cap](https://github.com/CapSoftware/Cap) 的非官方中文分支，供个人使用和继续开发。项目保留原仓库的 AGPLv3、MIT 及第三方许可证，不修改许可证验证，也不冒充 Cap 官方付费账户。
+这是基于 [CapSoftware/Cap](https://github.com/CapSoftware/Cap) 的非官方简体中文构建，面向 macOS Apple Silicon 和 Windows x64，供个人使用和继续开发。项目保留原仓库的 AGPLv3、MIT 及第三方许可证，不修改许可证验证，也不冒充 Cap 官方付费账户。
 
 > [!IMPORTANT]
 > 本仓库及其构建产物不是 Cap Software 官方中文版，也未获得其认可或背书。Cap 名称、标志及相关商标归各自权利人所有。本仓库只提供开源代码的中文本地化与非官方构建，不提供官方代码签名、官方订阅权益或官方技术支持。
+
+返回快速下载和安装说明：[README.md](README.md)。
 
 ## 已完成
 
@@ -22,7 +24,20 @@ pnpm desktop:i18n:check
 
 如果上游新增了尚未收录的界面文案，命令会失败并列出缺失项。
 
-## 构建 Windows 安装包
+## 下载当前构建
+
+| 平台 | Artifact | 下载页面 |
+| --- | --- | --- |
+| macOS Apple Silicon | `Cap 中文版_0.5.9_aarch64.dmg` | [直接下载](https://github.com/fxbillu/cap-cn-local/releases/download/v0.5.9-cn.1/Cap%20%E4%B8%AD%E6%96%87%E7%89%88_0.5.9_aarch64.dmg) |
+| Windows x64 | `Cap 中文版_0.5.9_x64-setup.exe` | [直接下载](https://github.com/fxbillu/cap-cn-local/releases/download/v0.5.9-cn.1/Cap%20%E4%B8%AD%E6%96%87%E7%89%88_0.5.9_x64-setup.exe) |
+
+完整发行说明：[v0.5.9-cn.1](https://github.com/fxbillu/cap-cn-local/releases/tag/v0.5.9-cn.1)。安装包作为 GitHub Release 附件长期提供，不依赖会过期的 Actions Artifact。
+
+macOS 构建仅支持 Apple Silicon。下载后解压、打开 `.dmg`，将 `Cap 中文版.app` 拖入“应用程序”。由于构建未签名，首次启动可能需要在“系统设置 → 隐私与安全性”中选择仍要打开。
+
+Windows 构建包含未签名的 NSIS 安装程序，可能触发 SmartScreen 提示。只有在确认下载来源是本仓库构建页面后，才选择继续安装。
+
+## 从源码构建 Windows 安装包
 
 最省事的方式是在你自己的 GitHub 分支中运行 **Build Cap Chinese Windows** 工作流：
 
