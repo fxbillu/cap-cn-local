@@ -4,6 +4,9 @@
 
 <h1 align="center">Cap</h1>
 
+> [!IMPORTANT]
+> This repository is an unofficial Simplified Chinese build based on [CapSoftware/Cap](https://github.com/CapSoftware/Cap). It is not affiliated with or endorsed by Cap Software. The Cap name, logo, and trademarks belong to their respective owners. See [README_CN.md](README_CN.md) for the Chinese build scope, service boundaries, and licensing notes.
+
 <p align="center">
 	Beautiful, shareable screen recordings. Open source, fast, and built for teams that want to own their data.
 </p>
