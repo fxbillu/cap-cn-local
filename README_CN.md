@@ -28,8 +28,8 @@ pnpm desktop:i18n:check
 
 | 平台 | Artifact | 下载页面 |
 | --- | --- | --- |
-| macOS Apple Silicon | `Cap 中文版_0.5.9_aarch64.dmg` | [直接下载](https://github.com/fxbillu/cap-cn-local/releases/download/v0.5.9-cn.1/Cap%20%E4%B8%AD%E6%96%87%E7%89%88_0.5.9_aarch64.dmg) |
-| Windows x64 | `Cap 中文版_0.5.9_x64-setup.exe` | [直接下载](https://github.com/fxbillu/cap-cn-local/releases/download/v0.5.9-cn.1/Cap%20%E4%B8%AD%E6%96%87%E7%89%88_0.5.9_x64-setup.exe) |
+| macOS Apple Silicon | `Cap-CN-0.5.9-macos-arm64.dmg` | [直接下载](https://github.com/fxbillu/cap-cn-local/releases/download/v0.5.9-cn.1/Cap-CN-0.5.9-macos-arm64.dmg) |
+| Windows x64 | `Cap-CN-0.5.9-windows-x64-setup.exe` | [直接下载](https://github.com/fxbillu/cap-cn-local/releases/download/v0.5.9-cn.1/Cap-CN-0.5.9-windows-x64-setup.exe) |
 
 完整发行说明：[v0.5.9-cn.1](https://github.com/fxbillu/cap-cn-local/releases/tag/v0.5.9-cn.1)。安装包作为 GitHub Release 附件长期提供，不依赖会过期的 Actions Artifact。
 

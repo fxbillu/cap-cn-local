@@ -13,8 +13,8 @@
 
 | 平台 | 当前构建 | 下载入口 | 适用设备 |
 | --- | --- | --- | --- |
-| macOS | `Cap 中文版_0.5.9_aarch64.dmg` | [下载 macOS 安装包](https://github.com/fxbillu/cap-cn-local/releases/download/v0.5.9-cn.1/Cap%20%E4%B8%AD%E6%96%87%E7%89%88_0.5.9_aarch64.dmg) | Apple Silicon（M1/M2/M3/M4） |
-| Windows | `Cap 中文版_0.5.9_x64-setup.exe` | [下载 Windows 安装包](https://github.com/fxbillu/cap-cn-local/releases/download/v0.5.9-cn.1/Cap%20%E4%B8%AD%E6%96%87%E7%89%88_0.5.9_x64-setup.exe) | 64 位 Intel / AMD Windows |
+| macOS | `Cap-CN-0.5.9-macos-arm64.dmg` | [下载 macOS 安装包](https://github.com/fxbillu/cap-cn-local/releases/download/v0.5.9-cn.1/Cap-CN-0.5.9-macos-arm64.dmg) | Apple Silicon（M1/M2/M3/M4） |
+| Windows | `Cap-CN-0.5.9-windows-x64-setup.exe` | [下载 Windows 安装包](https://github.com/fxbillu/cap-cn-local/releases/download/v0.5.9-cn.1/Cap-CN-0.5.9-windows-x64-setup.exe) | 64 位 Intel / AMD Windows |
 
 下载页：[v0.5.9-cn.1](https://github.com/fxbillu/cap-cn-local/releases/tag/v0.5.9-cn.1)。这是长期 Release 附件，不依赖会过期的 Actions Artifact。
 
@@ -22,14 +22,14 @@
 
 ### macOS（Apple Silicon）
 
-1. 下载 `Cap 中文版_0.5.9_aarch64.dmg` 并打开。
+1. 下载 `Cap-CN-0.5.9-macos-arm64.dmg` 并打开。
 2. 将 `Cap 中文版.app` 拖入“应用程序”。
 3. 首次打开时，macOS 可能提示“无法验证开发者”。在“系统设置 → 隐私与安全性”中选择仍要打开。
 4. 按应用引导授权屏幕录制、麦克风、摄像头和辅助功能权限。没有这些权限，录制功能无法正常工作。
 
 ### Windows（x64）
 
-1. 下载并运行 `Cap 中文版_0.5.9_x64-setup.exe`。
+1. 下载并运行 `Cap-CN-0.5.9-windows-x64-setup.exe`。
 2. SmartScreen 可能因未签名而提示风险；只有在确认下载来源是本仓库构建页面后，才选择继续安装。
 3. 首次录制时，按引导授予屏幕、麦克风和摄像头权限。
 

@@ -14,3 +14,10 @@
 - Scope: rewrote the root README around current macOS Apple Silicon and Windows x64 artifacts; added a repository-native SVG hero; aligned the detailed Chinese guide with both platforms.
 - Validation: download targets reference completed workflow runs and their artifact names; all installer and trademark warnings remain visible before users install.
 - Risk: release attachments are unsigned and must continue to be described as unofficial; direct links must be updated for every future version.
+
+## 2026-08-10 — v0.5.9-cn.1 installer release
+
+- Scope: published the verified macOS Apple Silicon and Windows x64 installers as permanent GitHub Release attachments.
+- Assets: `Cap-CN-0.5.9-macos-arm64.dmg` and `Cap-CN-0.5.9-windows-x64-setup.exe`; both were uploaded after ZIP integrity checks and SHA-256 readback.
+- Validation: GitHub release metadata reports both assets in `uploaded` state with the expected sizes and digests.
+- Risk: both assets remain unsigned and must retain the non-official installation warnings in the release notes and README.
